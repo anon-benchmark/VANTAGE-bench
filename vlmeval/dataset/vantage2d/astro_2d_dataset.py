@@ -107,9 +107,8 @@ def compute_bbox_area(bbox):
 # Default prompt for detection
 DETECTION_PROMPT = (
     "Locate every instance that belongs to the following categories: 'person'. "
-    "For each instance of the class, report bbox coordinates in JSON format. "
-    "Do not group instances and report only individual instances. "
-    "Avoid reporting duplicate instances."
+    'Report bbox coordinates as JSON: [{"bbox_2d": [x1, y1, x2, y2], "label": "..."}]. '
+    "Coordinates normalized to 0-1000."
 )
 
 
@@ -119,13 +118,19 @@ def map_label_to_person(label):
 
     Args:
         label: Original label string
- 
+
     Returns:
         'person' if label is a person type, otherwise original label
     """
-    if label.lower() in PERSON_CATEGORIES:
+    if label is None or isinstance(label, (list, tuple, dict)):
         return 'person'
-    return label.lower()
+
+    label = str(label).strip().lower()
+
+    person_categories = {str(x).strip().lower() for x in PERSON_CATEGORIES}
+    if label in person_categories:
+        return 'person'
+    return label
 
 
 class Astro2DDetectionDataset(ImageBaseDataset):
@@ -171,7 +176,10 @@ class Astro2DDetectionDataset(ImageBaseDataset):
         if data_root is None:
             # Try to load from datasets.yaml
             dataset_cfg = load_dataset_config(dataset) or {}
-            if dataset_cfg and 'data_root' in dataset_cfg:
+            # Only fall back to the yaml's hardcoded data_root when the LMUDataRoot()
+            # resolution above did not yield one; otherwise the yaml's '~/LMUData/...'
+            # would clobber the LMUData env (e.g. the GT-source copy) set for the run.
+            if self.data_root is None and dataset_cfg and 'data_root' in dataset_cfg:
                 self.data_root = dataset_cfg['data_root']
         else:
             dataset_cfg = load_dataset_config(dataset) or {}
@@ -251,7 +259,10 @@ class Astro2DDetectionDataset(ImageBaseDataset):
     def _get_image_files(self):
         """Get list of image files from the images directory."""
         if not os.path.exists(self.images_dir):
-            raise FileNotFoundError(f"Images directory not found: {self.images_dir}")
+            raise FileNotFoundError(
+                f"Images directory not found: {self.images_dir}. "
+                "Run: python scripts/run_lmudata.py --task astro2d --lmu-root ~/LMUData"
+            )
 
         image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff'}
         image_files = []
@@ -310,6 +321,11 @@ class Astro2DDetectionDataset(ImageBaseDataset):
             image_path = os.path.join(self.images_dir, image_filename)
 
             # Load ground truth to check if there are objects
+            # Skip images with no exact-match label file
+            base_name = os.path.splitext(image_filename)[0]
+            label_path = os.path.join(self.labels_dir, base_name + ".txt")
+            if not os.path.exists(label_path):
+                continue
             gt_objects = self._load_ground_truth(image_filename)
 
             if self.custom_prompt is not None:
@@ -404,16 +420,10 @@ class Astro2DDetectionDataset(ImageBaseDataset):
     def evaluate(self, eval_file, **judge_kwargs):
         """
         Evaluate predictions using Precision, Recall, and F1 score at multiple IoU thresholds.
-
-        All predictions and ground truth labels are mapped to 'person' category
-        before evaluation. Bboxes with area smaller than min_bbox_area are filtered out.
-
-        Reports:
-        - F1@0.5: F1 score at IoU threshold 0.5
-        - F1@0.95: F1 score at IoU threshold 0.95
-        - F1@mIOU: Mean F1 score across IoU thresholds from 0.5 to 0.95 (step 0.05)
         """
         logger = get_logger('Astro2D')
+
+        from vlmeval.dataset.utils.vantagebench.emit import emit_submission
 
         # Try different file extensions if the specified one doesn't exist
         if not os.path.exists(eval_file):
@@ -442,16 +452,16 @@ class Astro2DDetectionDataset(ImageBaseDataset):
             logger.info(f'Loaded {len(data)} predictions from {eval_file}')
         except Exception as e:
             logger.error(f'Failed to load predictions: {e}')
-            return {
-                'precision': 0.0,
-                'recall': 0.0,
-                'f1': 0.0,
-                'f1_0.95': 0.0,
-                'f1_mIOU': 0.0,
-                'total_predictions': 0,
-                'valid_bbox_predictions': 0,
-                'error': str(e)
-            }
+            return {'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'f1_at_0_95': 0.0, 'f1_miou': 0.0, 'error': str(e)}
+
+        _suffix = eval_file.split('.')[-1]
+        submission_path = eval_file.replace(f'.{_suffix}', '_submission.jsonl')
+        emit_submission(data, os.path.splitext(os.path.basename(eval_file))[0], submission_path, task='astro')
+        print(f"Submission written to: {submission_path}")
+
+        has_gt = hasattr(self, 'labels_dir') and os.path.isdir(self.labels_dir) and bool(os.listdir(self.labels_dir))
+        if not has_gt:
+            return {}
 
         # Collect all predictions and ground truths for multi-threshold evaluation
         all_predictions = []  # List of (pred_boxes_person, gt_boxes_person) tuples
@@ -478,12 +488,20 @@ class Astro2DDetectionDataset(ImageBaseDataset):
                 logger.error(f"Failed to load image {image_path}: {e}")
                 width, height = 640, 480
 
+            # Coordinate convention the model emits boxes in (from the submission
+            # metadata via the adapter). Gemini emits yxyx across ALL formats/keys
+            # ('box_2d' as well as 'bbox_2d'/'bbox' and plain lists), not just the
+            # 'box_2d' key; when yxyx, swap every prediction to xyxy. Default 'xyxy'
+            # preserves the legacy behavior (only the box_2d key swapped).
+            _coord_yxyx = str(judge_kwargs.get('box_coord_order', 'xyxy')).lower() == 'yxyx'
             # Normalize prediction format
             pred_boxes = []
             for pred in pred_boxes_raw:
                 if isinstance(pred, (list, tuple)):
                     # Plain [x1, y1, x2, y2] coordinate list
                     bbox = _normalize_pred_bbox(pred, sample_id=idx)
+                    if bbox is not None and _coord_yxyx:
+                        bbox = [bbox[1], bbox[0], bbox[3], bbox[2]]
                     if bbox is not None:
                         bbox = scale_bbox(bbox, height, width, scale_factor=1000)
                     if bbox is not None and len(bbox) >= 4:
@@ -507,8 +525,9 @@ class Astro2DDetectionDataset(ImageBaseDataset):
                         bbox = _normalize_pred_bbox(bbox, sample_id=idx)
                     if bbox is not None:
                         # Gemini's native 'box_2d' is [y1, x1, y2, x2] in 0-1000 space;
-                        # scale_bbox expects [x1, y1, x2, y2], so swap axes.
-                        if key == 'box_2d':
+                        # scale_bbox expects [x1, y1, x2, y2], so swap axes. In yxyx mode
+                        # every key is yxyx (Gemini ignores the requested order).
+                        if key == 'box_2d' or _coord_yxyx:
                             bbox = [bbox[1], bbox[0], bbox[3], bbox[2]]
                         bbox = scale_bbox(bbox, height, width, scale_factor=1000)
 
@@ -574,12 +593,7 @@ class Astro2DDetectionDataset(ImageBaseDataset):
         # Compute mean F1 across all thresholds (F1@mIOU)
         f1_mIOU = np.mean([f1_scores[t]['f1'] for t in iou_thresholds])
 
-        result = {
-            'precision': float(precision * 100),
-            'recall': float(recall * 100),
-            'f1': float(f1_05 * 100),
-            'f1_0.95': float(f1_095 * 100),
-            'f1_mIOU': float(f1_mIOU * 100),
+        debug_info = {
             'total_predictions': len(data),
             'valid_bbox_predictions': valid_count,
             'valid_rate': valid_count / len(data) if len(data) > 0 else 0,
@@ -597,18 +611,25 @@ class Astro2DDetectionDataset(ImageBaseDataset):
                            "Check that the prediction JSON uses a recognized key: "
                            "bbox_2d, box_2d, or bbox.")
 
-        logger.info(f"Precision@IoU=0.5: {result['precision']:.2f}%")
-        logger.info(f"Recall@IoU=0.5: {result['recall']:.2f}%")
-        logger.info(f"F1@IoU=0.5: {result['f1']:.2f}%")
-        logger.info(f"F1@IoU=0.95: {result['f1_0.95']:.2f}%")
-        logger.info(f"F1@mIOU (0.5:0.05:0.95): {result['f1_mIOU']:.2f}%")
+        logger.info(f"Precision@IoU=0.5: {precision:.4f}")
+        logger.info(f"Recall@IoU=0.5: {recall:.4f}")
+        logger.info(f"F1@IoU=0.5: {f1_05:.4f}")
+        logger.info(f"F1@IoU=0.95: {f1_095:.4f}")
+        logger.info(f"F1@mIOU (0.5:0.05:0.95): {f1_mIOU:.4f}")
         logger.info(f"TP: {total_tp}, FP: {total_fp}, FN: {total_gt - total_tp}")
-        logger.info(f"Valid predictions: {valid_count}/{len(data)} ({result['valid_rate']:.2%})")
+        logger.info(f"Valid predictions: {valid_count}/{len(data)} ({debug_info['valid_rate']:.2%})")
         logger.info(f"Filtered small bboxes - GT: {total_gt_filtered}, Pred: {total_pred_filtered}")
 
         suffix = eval_file.split('.')[-1]
         score_file = eval_file.replace(f'.{suffix}', '_metrics.json')
-        dump(result, score_file)
+        dump({**debug_info, 'f1': f1_05, 'precision': precision, 'recall': recall,
+              'f1_at_0_95': f1_095, 'f1_miou': f1_mIOU}, score_file)
         logger.info(f"Metrics saved to {score_file}")
 
-        return result
+        return {
+            'f1': float(f1_05),
+            'precision': float(precision),
+            'recall': float(recall),
+            'f1_at_0_95': float(f1_095),
+            'f1_miou': float(f1_mIOU),
+        }

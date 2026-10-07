@@ -52,6 +52,25 @@ DEFAULT_FRAME_STRIDE = 15  # sample every 15th source frame (0.5s at 30fps);
 FREEZE_IOU_THRESHOLD = 0.95  # bbox is "frozen" if IoU with prev frame >= this
 
 
+def _is_valid_sot_dir(path: str) -> bool:
+    """A directory is a valid SOT prepared dir iff it contains at least one
+    subdirectory with both gt.json and a frames/ folder."""
+    p = Path(path)
+    if not p.is_dir():
+        return False
+    try:
+        children = list(p.iterdir())
+    except OSError:
+        return False
+    for child in children:
+        try:
+            if child.is_dir() and (child / 'gt.json').exists() and (child / 'frames').is_dir():
+                return True
+        except OSError:
+            continue
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Prompt
 # ---------------------------------------------------------------------------
@@ -89,13 +108,69 @@ Then output ONLY a JSON object with a key for EVERY frame from 1 to {last_frame}
 You MUST include all {last_frame} frames — do not skip any frame index.
 """
 
+# Gemini/Gemma4 use yxyx coordinate order. Both the prompt and parser are
+# dispatched by model_family so the round-trip is consistent.
+SOT_PROMPT_INTRO_GEMINI = """\
+You are a visual object tracker. Track a specific {object_type} across {n_frames} video frames.
 
-def build_sot_prompt(n_frames: int, init_bbox: List[float], object_type: str = "object") -> str:
-    init_bbox_str = "[{}, {}, {}, {}]".format(
-        round(init_bbox[0]), round(init_bbox[1]),
-        round(init_bbox[2]), round(init_bbox[3]),
-    )
-    return SOT_PROMPT_INTRO.format(
+The TARGET is shown in the crop image above AND highlighted with a GREEN RECTANGLE in Frame 0.
+Its initial bounding box is {init_bbox} (format: [y1, x1, y2, x2], coordinates in 0-1000 space \
+where 0=top/left edge, 1000=bottom/right edge).
+
+Frames 1 to {last_frame} show the scene without any markings — locate the same {object_type} in each.
+
+Tracking rules:
+- Output a bounding box for EVERY frame from 1 to {last_frame}
+- If the object moves, your bbox MUST reflect its new position — do NOT copy the Frame 0 bbox \
+  to every frame; that is freezing, not tracking
+- If the object is partially occluded or briefly unclear, estimate its position based on its \
+  last known location and direction of movement
+- Only output null if the object has completely exited the frame boundaries with no visible trace
+- Track precisely: observe how the object's position changes between consecutive frames
+
+First, reason through the motion step by step:
+- Look at frames 1 to {last_frame} and describe how the {object_type} moves (direction, speed, any occlusion)
+- Use this reasoning to determine the precise bbox for each frame
+
+Then output ONLY a JSON object with a key for EVERY frame from 1 to {last_frame} (no other text after it):
+{{
+  "frame_1": [y1, x1, y2, x2],
+  "frame_2": [y1, x1, y2, x2],
+  "frame_3": [y1, x1, y2, x2],
+  ...
+  "frame_{last_frame}": [y1, x1, y2, x2]
+}}
+You MUST include all {last_frame} frames — do not skip any frame index.
+"""
+
+_SOT_INTRO_BY_FAMILY: Dict[str, str] = {
+    'cr':     SOT_PROMPT_INTRO,
+    'qwen3':  SOT_PROMPT_INTRO,
+    'gemini': SOT_PROMPT_INTRO_GEMINI,
+    'gemma4': SOT_PROMPT_INTRO_GEMINI,
+}
+
+
+def build_sot_prompt(
+    n_frames: int,
+    init_bbox: List[float],
+    object_type: str = "object",
+    model_family: str = "cr",
+) -> str:
+    is_gemini = model_family in ('gemini', 'gemma4')
+    if is_gemini:
+        # Present init bbox in yxyx order to match the Gemini prompt template
+        init_bbox_str = "[{}, {}, {}, {}]".format(
+            round(init_bbox[1]), round(init_bbox[0]),
+            round(init_bbox[3]), round(init_bbox[2]),
+        )
+    else:
+        init_bbox_str = "[{}, {}, {}, {}]".format(
+            round(init_bbox[0]), round(init_bbox[1]),
+            round(init_bbox[2]), round(init_bbox[3]),
+        )
+    intro = _SOT_INTRO_BY_FAMILY.get(model_family, SOT_PROMPT_INTRO)
+    return intro.format(
         n_frames=n_frames,
         last_frame=n_frames - 1,
         init_bbox=init_bbox_str,
@@ -161,15 +236,51 @@ def extract_target_crop(
 # Output parsing
 # ---------------------------------------------------------------------------
 
-def parse_sot_response(text: str, n_frames: int) -> Dict[int, Optional[List[float]]]:
+_FRAME_TUP_RE = re.compile(
+    r'"frame[_]?(\d+)"\s*:\s*\[\s*'
+    r'(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*'
+    r'(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\]'
+)
+
+
+def _regex_extract_frame_bboxes(
+    text: str,
+    n_frames: int,
+    swap_yx: bool,
+) -> Dict[int, List[float]]:
+    """Regex fallback for truncated or list-wrapped JSON. First match per frame wins."""
+    result: Dict[int, List[float]] = {}
+    for m in _FRAME_TUP_RE.finditer(str(text)):
+        idx = int(m.group(1))
+        if idx < 1 or idx >= n_frames or idx in result:
+            continue
+        bbox = [float(m.group(i + 2)) for i in range(4)]
+        if swap_yx:
+            bbox = [bbox[1], bbox[0], bbox[3], bbox[2]]
+        bbox = [max(0.0, min(b, 1000.0)) for b in bbox]
+        if bbox[2] > bbox[0] and bbox[3] > bbox[1]:
+            result[idx] = bbox
+    return result
+
+
+def parse_sot_response(
+    text: str,
+    n_frames: int,
+    model_family: str = "cr",
+) -> Dict[int, Optional[List[float]]]:
     """
     Parse VLM response into {frame_idx: bbox_or_None}.
 
     Frame indices are 1-based in the response (frame_1 ... frame_{n-1})
     since frame_0 is the initialization frame.
 
+    For Gemini/Gemma4 (model_family in ('gemini', 'gemma4')) the per-frame
+    tuples are in yxyx order and are swapped to xyxy before returning.
+
     Returns dict for frames 1..n_frames-1. Missing frames → None.
     """
+    swap_yx = model_family in ('gemini', 'gemma4')
+
     if not text or pd.isna(text):
         return {}
 
@@ -183,7 +294,6 @@ def parse_sot_response(text: str, n_frames: int) -> Dict[int, Optional[List[floa
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
-        # Try to find a JSON object anywhere in the response
         match = re.search(r'\{[\s\S]*\}', text)
         if match:
             try:
@@ -192,7 +302,7 @@ def parse_sot_response(text: str, n_frames: int) -> Dict[int, Optional[List[floa
                 pass
 
     if not isinstance(parsed, dict):
-        return {}
+        return dict(_regex_extract_frame_bboxes(text, n_frames, swap_yx))
 
     result = {}
     for key, val in parsed.items():
@@ -218,7 +328,9 @@ def parse_sot_response(text: str, n_frames: int) -> Dict[int, Optional[List[floa
             result[idx] = None
             continue
 
-        # Clamp to valid range
+        if swap_yx:
+            bbox = [bbox[1], bbox[0], bbox[3], bbox[2]]
+
         bbox = [
             max(0.0, min(bbox[0], 1000.0)),
             max(0.0, min(bbox[1], 1000.0)),
@@ -368,9 +480,14 @@ def compute_sot_metrics(
 
     n_eval = len(ious)
     if n_eval == 0:
+        # No evaluable frame (e.g. the object is absent in every non-init GT
+        # frame and the model never predicted a box). Score the sequence as
+        # 0 for every metric, with the same key set as the normal path, so
+        # the per-sequence table and the CSV writer never hit a KeyError.
         return {
-            'mean_iou': 0.0, 'precision': 0.0, 'freeze_rate': 0.0,
-            'null_rate': 0.0, 'false_det_rate': 0.0,
+            'mean_iou': 0.0, 'success_auc': 0.0,
+            'precision': 0.0, 'precision_25': 0.0, 'precision_75': 0.0,
+            'freeze_rate': 0.0, 'null_rate': 0.0, 'false_det_rate': 0.0,
             'visible_iou': 0.0, 'occluded_iou': 0.0,
             'n_eval_frames': 0,
         }
@@ -453,6 +570,8 @@ class VANTAGE_SOT(VideoBaseDataset):
         verbose: bool = False,
         # Path to metadata.jsonl (needed for new-format benchmarks missing init_bbox)
         metadata_path: Optional[str] = None,
+        # Model family controls coordinate order: 'gemini'/'gemma4' use yxyx, others xyxy
+        model_family: str = 'cr',
         # VideoBaseDataset compat args (accepted but unused internally)
         pack: bool = False,
         nframe: int = 0,
@@ -465,6 +584,7 @@ class VANTAGE_SOT(VideoBaseDataset):
         self.verbose = verbose
         self.nframe = nframe
         self.fps = fps
+        self.model_family = model_family
 
         preset = self.DATASET_CONFIGS.get(dataset, {})
         self.prepared_data_dir = prepared_data_dir
@@ -485,10 +605,15 @@ class VANTAGE_SOT(VideoBaseDataset):
                         self._metadata_index[entry['seq_id']] = entry
 
         if not self.prepared_data_dir:
-            raise ValueError(
-                "prepared_data_dir is required. "
-                "Run prepare_sot_hf.py to generate the dataset directory."
-            )
+            candidate = os.path.join(LMUDataRoot(), 'datasets', dataset)
+            if _is_valid_sot_dir(candidate):
+                self.prepared_data_dir = candidate
+                print(f"VANTAGE_SOT: using default prepared_data_dir = {candidate}")
+            else:
+                raise FileNotFoundError(
+                    f"VANTAGE_SOT data not found at {candidate}. "
+                    f"Run: python scripts/run_lmudata.py --task sot --lmu-root ~/LMUData"
+                )
 
         self._prepare_data_from_dir()
 
@@ -638,7 +763,7 @@ class VANTAGE_SOT(VideoBaseDataset):
 
         n_frames = len(frame_ids)
         object_type = cache.get('object_type', 'object')
-        prompt_text = build_sot_prompt(n_frames=n_frames, init_bbox=init_bbox, object_type=object_type)
+        prompt_text = build_sot_prompt(n_frames=n_frames, init_bbox=init_bbox, object_type=object_type, model_family=self.model_family)
 
         if not frame_paths:
             print(f"WARNING: No frames found for {label}")
@@ -660,6 +785,17 @@ class VANTAGE_SOT(VideoBaseDataset):
     def evaluate(self, eval_file: str, **judge_kwargs) -> Dict:
         assert get_file_extension(eval_file) in ['xlsx', 'json', 'tsv']
         data = load(eval_file)
+
+        from vlmeval.dataset.utils.vantagebench.emit import emit_submission
+        _suffix = eval_file.split('.')[-1]
+        submission_path = eval_file.replace(f'.{_suffix}', '_submission.jsonl')
+        emit_submission(data, osp.splitext(osp.basename(eval_file))[0], submission_path, task='sot', dataset=self)
+        print(f"Submission written to: {submission_path}")
+
+        has_gt = any(bool(c.get('gt_bboxes')) for c in self._gt_cache.values())
+        if not has_gt:
+            return {}
+
         verbose = judge_kwargs.get('verbose', False) or self.verbose
 
         if verbose:
@@ -693,7 +829,7 @@ class VANTAGE_SOT(VideoBaseDataset):
                 continue
 
             raw_pred = row.get('prediction', '')
-            pred_bboxes = parse_sot_response(raw_pred, n_frames)
+            pred_bboxes = parse_sot_response(raw_pred, n_frames, model_family=self.model_family)
 
             if not pred_bboxes and raw_pred and str(raw_pred).strip() not in ('', '{}'):
                 parse_failures += 1
@@ -814,4 +950,9 @@ class VANTAGE_SOT(VideoBaseDataset):
                 ])
 
         print(f"\nResults: {json_path}\nCSV:     {csv_path}")
-        return {k: v['mean_iou'] for k, v in results.items()}
+        overall = results.get('Overall', {})
+        return {
+            'mean_iou': float(overall.get('mean_iou', 0.0)),
+            'success_auc': float(overall.get('success_auc', 0.0)),
+            'precision_at_0_5': float(overall.get('precision', 0.0)),
+        }

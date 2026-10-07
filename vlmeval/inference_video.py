@@ -3,6 +3,7 @@ import torch.distributed as dist
 from vlmeval.config import supported_VLM
 from vlmeval.utils import track_progress_rich
 from vlmeval.smp import *
+from vlmeval.inference import generate_or_record, report_failed_samples
 
 FAIL_MSG = 'Failed to obtain answer via API.'
 
@@ -134,6 +135,7 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
         setattr(model, 'VIDEO_LLM', False)
 
     num_samples = len(sample_indices_subrem)
+    seen_errors = set()
     pbar = tqdm(
         enumerate(sample_indices_subrem),
         total=num_samples,
@@ -184,17 +186,7 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
         if struct is None:
             continue
 
-        # If `SKIP_ERR` flag is set, the model will skip the generation if error is encountered
-        if os.environ.get('SKIP_ERR', False) == '1':
-            FAIL_MSG = 'Failed to obtain answer'
-            try:
-                response = model.generate(message=struct, dataset=dataset_name)
-            except RuntimeError as err:
-                torch.cuda.synchronize()
-                warnings.error(f'{type(err)} {str(err)}')
-                response = f'{FAIL_MSG}: {type(err)} {str(err)}'
-        else:
-            response = model.generate(message=struct, dataset=dataset_name)
+        response = generate_or_record(model, struct, dataset_name, idx, seen_errors)
         torch.cuda.empty_cache()
 
         if verbose:
@@ -206,6 +198,7 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
 
     res = {k: res[k] for k in sample_indices_sub}
     dump(res, out_file)
+    report_failed_samples(res, model_name, dataset_name)
     return model
 
 
@@ -262,4 +255,38 @@ def infer_data_job_video(
         dump(meta, result_file)
         for i in range(world_size):
             os.remove(tmpl.format(i))
+
+        # VANTAGE canonical: emit submission JSONL alongside the legacy xlsx.
+        # Per-task gated, additive, best-effort: a failure here logs a warning
+        # and never breaks the legacy xlsx artifact.
+        if dataset_name.startswith('VANTAGE_VQA'):
+            from vlmeval.dataset.utils.vantagebench.emit import emit_submission
+            submission_path = osp.splitext(result_file)[0] + '.submission.jsonl'
+            emit_submission(
+                meta, model_name, submission_path, task='vqa',
+                box_coord_order=getattr(model, 'box_coord_order', 'xyxy'))
+        if dataset_name.startswith('VANTAGE_EventVerification'):
+            from vlmeval.dataset.utils.vantagebench.emit import emit_submission
+            submission_path = osp.splitext(result_file)[0] + '.submission.jsonl'
+            emit_submission(
+                meta, model_name, submission_path, task='event_verification',
+                box_coord_order=getattr(model, 'box_coord_order', 'xyxy'))
+        if dataset_name.startswith('VANTAGE_Temporal'):
+            from vlmeval.dataset.utils.vantagebench.emit import emit_submission
+            submission_path = osp.splitext(result_file)[0] + '.submission.jsonl'
+            emit_submission(
+                meta, model_name, submission_path, task='temporal',
+                box_coord_order=getattr(model, 'box_coord_order', 'xyxy'))
+        if dataset_name.startswith('VANTAGE_DVC'):
+            from vlmeval.dataset.utils.vantagebench.emit import emit_submission
+            submission_path = osp.splitext(result_file)[0] + '.submission.jsonl'
+            emit_submission(
+                meta, model_name, submission_path, task='dvc',
+                box_coord_order=getattr(model, 'box_coord_order', 'xyxy'))
+        if dataset_name.startswith('VANTAGE_SOT'):
+            from vlmeval.dataset.utils.vantagebench.emit import emit_submission
+            submission_path = osp.splitext(result_file)[0] + '.submission.jsonl'
+            # SOT requires dataset for canonical id resolution from _gt_cache.
+            emit_submission(meta, model_name, submission_path, task='sot', dataset=dataset,
+                            box_coord_order=getattr(model, 'box_coord_order', 'xyxy'))
     return model

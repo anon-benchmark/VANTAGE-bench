@@ -213,7 +213,11 @@ SenseNova*
 .DS_Store
 
 temp
-result*
+# Only ignore result artifacts, not source under vlmeval/ (e.g.
+# vlmeval/utils/result_transfer.py). A bare `result*` previously swept that
+# source file out of version control.
+/result*
+*.result
 
 
 # slurm and tsv file creation
@@ -224,3 +228,18 @@ output.txt
 
 4_2_outputs/
 *debug_*.txt
+
+# Local benchmark runner configs (not committed)
+vantage_benchmarks/
+
+# SLURM job logs
+*.out
+*.err
+
+# Benchmark output directories
+outputs/
+outputs_*/
+
+# vantage_benchmarks configs that aren't committed
+c3n_vqa4fps_*.out
+c3n_vqa4fps_*.err

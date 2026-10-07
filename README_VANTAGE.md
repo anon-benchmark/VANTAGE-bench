@@ -17,6 +17,7 @@ This document is the single source of truth for running, configuring, and extend
 9. [Output structure](#9-output-structure)
 10. [Data directory layout](#10-data-directory-layout)
 11. [Prediction file schema (eval inputs)](#11-prediction-file-schema-eval-inputs)
+12. [Per-model requirements](#12-per-model-requirements)
 
 ---
 
@@ -32,12 +33,11 @@ vlmeval/
 │   ├── vantage_sot.py                  # VANTAGE_SOT — single-object tracking
 │   ├── vantage2d/
 │   │   ├── __init__.py
-│   │   ├── detection_2d_dataset.py     # VANTAGE_2DDetectionDataset (image)
 │   │   ├── grounding_2d_dataset.py     # VANTAGE_2DGroundingDataset (image)
 │   │   ├── astro_2d_dataset.py         # Astro2DDetectionDataset (image)
-│   │   ├── pointing_dataset.py         # VANTAGE_2DPointing (image)
-│   │   ├── datasets.yaml               # per-dataset config (classes, S3 paths)
-│   │   └── utils.py                    # shared bbox / AP helpers
+│   │   ├── datasets.yaml               # per-dataset config (classes, local data_root)
+│   │   └── utils.py                    # shared bbox / IoU / KITTI-label helpers
+│   ├── image_mcq.py                    # VANTAGE_2DPointing (image MCQ)
 │   ├── __init__.py                     # imports + IMAGE_DATASET / VIDEO_DATASET lists
 │   └── video_dataset_config.py         # all video variant registrations
 ├── vlm/                                # local model wrappers (HuggingFace / vLLM)
@@ -66,15 +66,18 @@ vlmutil mlist all
 
 ```bash
 # 1. Create environment (Python 3.10+)
-conda create -n vlmeval python=3.10 -y
-conda activate vlmeval
+conda create -n vantage python=3.10 -y
+conda activate vantage
 
-# 2. Install dependencies
-cd /path/to/vlmevalkit
+# 2. Install ffmpeg (required for VANTAGE-SOT frame extraction)
+conda install -c conda-forge ffmpeg -y
+
+# 3. Install dependencies
+cd /path/to/VANTAGE-Bench
 pip install -r requirements.txt
 pip install -e .
 
-# 3. (Optional) vLLM backend for local inference
+# 4. (Optional) vLLM backend for local inference
 pip install vllm
 ```
 
@@ -82,16 +85,9 @@ pip install vllm
 
 ## 3. Environment variables
 
-### S3 dataset download
+### Dataset location
 
-These are only needed when data is not already present under `$LMUDataRoot/datasets/<DatasetName>/`.
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `VANTAGE_S3_PROFILE` | `default` | AWS credentials profile in `~/.aws/credentials` |
-| `VANTAGE_S3_REGION` | — | AWS region override |
-| `VANTAGE_S3_ENDPOINT_URL` | — | S3-compatible endpoint (omit for standard AWS) |
-| `VANTAGE_S3_DOWNLOAD_WORKERS` | `8` | Parallel download threads |
+Datasets are read from `$LMUData/datasets/<DatasetName>/` only; populate it with `scripts/run_lmudata.py` (see [`scripts/RUN_LMUData.md`](scripts/RUN_LMUData.md)). There is no S3 download path in this repository: no code reads `VANTAGE_S3_*` environment variables, and `Astro2D` rejects an `s3://` `data_root`.
 
 ### API model inference
 
@@ -107,7 +103,13 @@ Most API wrappers in `vlmeval/api/` read these standard variables. Per-model env
 | Variable | Description |
 |----------|-------------|
 | `MMEVAL_ROOT` | Override `--work-dir`; outputs are written here when set |
-| `LMUDataRoot` | Root for cached dataset TSVs and media files (default: `~/LMUData`) |
+| `LMUData` | Root for cached dataset TSVs and media files (default: `~/LMUData`) |
+
+You can also override the data root at the CLI level without setting an env var:
+
+```bash
+python run.py --lmudata-root /path/to/data --data VANTAGE_VQA_8frame --model <ModelName>
+```
 
 ---
 
@@ -124,6 +126,7 @@ Pass any of these strings as the `--data` argument or as a key in the config JSO
 | `VANTAGE_VQA_8frame` | 8 frames uniformly sampled |
 | `VANTAGE_VQA_16frame` | 16 frames |
 | `VANTAGE_VQA_64frame` | 64 frames |
+| `VANTAGE_VQA_4fps` | 4 fps (up to 256 frames, pixel-capped) |
 | `VANTAGE_VQA_1fps` | 1 frame per second |
 | `VANTAGE_VQA_0.5fps` | 0.5 fps |
 | `VANTAGE_VQA_8frame_200` | 8 frames, 200-sample subset (seed 42) |
@@ -137,6 +140,7 @@ Pass any of these strings as the `--data` argument or as a key in the config JSO
 | `VANTAGE_Temporal_64frame` | 64 frames |
 | `VANTAGE_Temporal_1fps` | 1 fps |
 | `VANTAGE_Temporal_0.5fps` | 0.5 fps |
+| `VANTAGE_Temporal_10fps` | 10 fps |
 
 #### VANTAGE_DVC — dense video captioning
 
@@ -155,6 +159,7 @@ Pass any of these strings as the `--data` argument or as a key in the config JSO
 | `VANTAGE_EventVerification_8frame` | 8 frames (fps override=0 to force nframe mode) |
 | `VANTAGE_EventVerification_16frame` | 16 frames |
 | `VANTAGE_EventVerification_1fps` | 1 fps |
+| `VANTAGE_EventVerification_4fps` | 4 fps |
 
 #### VANTAGE_SOT — single-object tracking
 
@@ -163,16 +168,16 @@ Pass any of these strings as the `--data` argument or as a key in the config JSO
 | `VANTAGE_SOT` | default 8 frames, stride 15 |
 | `VANTAGE_SOT_16f` | 16 frames |
 | `VANTAGE_SOT_32f` | 32 frames |
-| `VANTAGE_SOT_tiny` | small validation subset |
 
 ### Image datasets (registered in `__init__.py → IMAGE_DATASET`)
 
-| Dataset class | Registered name(s) | Task |
-|---------------|--------------------|------|
-| `VANTAGE_2DDetectionDataset` | via `supported_datasets()` | 2D detection, KITTI format |
-| `VANTAGE_2DGroundingDataset` | `VANTAGE_2DGrounding`, `VANTAGE_2DGrounding_val` | Referring expression grounding |
-| `Astro2DDetectionDataset` | via `supported_datasets()` | Astro 2D detection |
-| `VANTAGE_2DPointing` | via `supported_datasets()` | Spatial pointing |
+| Dataset class | Registered name(s) | Task | Submit? |
+|---------------|--------------------|------|---------|
+| `VANTAGE_2DGroundingDataset` | `VANTAGE_2DGrounding` | Referring expression grounding | ✓ |
+| `VANTAGE_2DGroundingDataset` | `VANTAGE_2DGrounding_val` | Grounding — validation split | dev only |
+| `VANTAGE_2DGroundingDataset` | `VANTAGE_2DGrounding_small` | Grounding — small debug subset | dev only |
+| `Astro2DDetectionDataset` | `Astro2D` | Astro 2D person detection | ✓ |
+| `VANTAGE_2DPointing` | `VANTAGE_2DPointing` | Spatial pointing MCQ | ✓ |
 
 ---
 
@@ -437,7 +442,7 @@ python run.py \
 
 Reads the existing prediction file and writes evaluation results alongside it. GT is resolved from the dataset TSV at eval time — the prediction file does **not** need GT columns.
 
-See [docs/en/VANTAGEEvalInputs.md](docs/en/VANTAGEEvalInputs.md) for the minimum columns required by each evaluator.
+See [docs/vantage/VANTAGEEvalInputs.md](docs/vantage/VANTAGEEvalInputs.md) for the minimum columns required by each evaluator.
 
 ---
 
@@ -462,15 +467,12 @@ See [docs/en/VANTAGEEvalInputs.md](docs/en/VANTAGEEvalInputs.md) for the minimum
 
 ## 10. Data directory layout
 
-Dataset files are resolved in this order:
-
-1. `$LMUDataRoot/datasets/<DatasetName>/` (local cache, checked first)
-2. S3 bucket configured via `VANTAGE_S3_*` env vars
+Dataset files are loaded from `$LMUData/datasets/<DatasetName>/`. Populate this using `scripts/run_lmudata.py`. There is no S3 fallback, and no code reads `VANTAGE_S3_*` environment variables.
 
 Expected local layout for video datasets:
 
 ```
-$LMUDataRoot/datasets/VANTAGE_VQA/
+$LMUData/datasets/VANTAGE_VQA/
 ├── VANTAGE_VQA.tsv          # main annotation file
 └── videos/
     ├── <video_id_1>.mp4
@@ -493,4 +495,36 @@ GT is always resolved from the dataset TSV at eval time. Prediction files only n
 | `prediction` | yes | Raw model output string |
 | `video` | fallback | Used to resolve GT when `index` lookup fails |
 
-Each evaluator's minimum required columns are documented in [docs/en/VANTAGEEvalInputs.md](docs/en/VANTAGEEvalInputs.md).
+Each evaluator's minimum required columns are documented in [docs/vantage/VANTAGEEvalInputs.md](docs/vantage/VANTAGEEvalInputs.md).
+
+---
+
+## 12. Per-model requirements
+
+Each model backend has different install and hardware requirements. Use the table below to pick the right setup before running.
+
+| Model class | Config file | Min GPU VRAM | Required packages | Required env vars |
+|---|---|---|---|---|
+| `Cosmos` (vLLM) | `configs/cosmos_reason2_8b.json` | 1 × 24 GB | `vllm`, `qwen-vl-utils` | — |
+| `Cosmos` (vLLM) | `configs/cosmos_reason2_32b.json` | 2 × 80 GB | `vllm`, `qwen-vl-utils` | — |
+| `Cosmos` (vLLM) | `configs/cosmos_reason1_7b.json` | 1 × 16 GB | `vllm`, `qwen-vl-utils` | — |
+| `CosmosHF` | `configs/cosmos_reason2_8b_hf.json` | 1 × 16 GB | `qwen-vl-utils` | — |
+| `Cosmos3` | `configs/cosmos3_nano.json` | 1 × 8 GB | `transformers_cosmos3`\* | — |
+| `Cosmos3vLLM` | (config or CLI key) | 1+ GPU | `vllm`, `qwen-vl-utils` | — |
+| `CosmosReason2` (API) | `configs/cosmos_reason2_api.json` | None | `qwen-vl-utils`, `ffmpeg` | `COSMOS_REASON2_API_BASE`, `COSMOS_API_KEY` or `NVIDIA_API_KEY` |
+| `GPT4V` | `configs/gpt4o.json` | None | — | `OPENAI_API_KEY` |
+
+\* Install `transformers_cosmos3` from source:
+```bash
+pip install "transformers_cosmos3 @ git+https://github.com/NVIDIA/cosmos-framework.git#subdirectory=packages/transformers-cosmos3"
+```
+
+**Cosmos3-Nano-vLLM note**: `Cosmos3vLLM` requires a pre-converted Qwen3VL checkpoint — the raw HuggingFace model will not work directly. Run the conversion script first:
+```bash
+python scripts/convert_cosmos3_for_vllm.py --model nvidia/Cosmos3-Nano --output /path/to/converted
+```
+Then pass the output directory as `model_path` in your config.
+
+**CosmosReason2 API note**: `COSMOS_REASON2_API_BASE` must be a **full endpoint URL** ending in `/v1/chat/completions` (e.g. `https://your-deployment.lepton.run/v1/chat/completions`). `ffmpeg` must be on `PATH` — it is used to encode video frames before sending them to the API.
+
+See [`configs/README.md`](configs/README.md) for ready-to-run config files and hardware notes.

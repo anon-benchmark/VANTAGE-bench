@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import sys
 from functools import partial
 
 
@@ -85,7 +86,13 @@ def build_dataset_from_config(cfg, dataset_name):
         cls = getattr(vlmeval.dataset, cls_name)
         sig = inspect.signature(cls.__init__)
         valid_params = {k: v for k, v in config.items() if k in sig.parameters}
-        if cls.MODALITY == 'VIDEO':
+        # Enforce fps/nframe only for VIDEO datasets whose frame count is actually
+        # controlled by them. Datasets that pre-sample frames (they expose
+        # 'clip_frames', e.g. VANTAGE_SOT) accept fps/nframe only vestigially and
+        # would otherwise be impossible to launch from a config.
+        _has_frame_ctrl = 'fps' in sig.parameters or 'nframe' in sig.parameters
+        _presampled = 'clip_frames' in sig.parameters
+        if cls.MODALITY == 'VIDEO' and _has_frame_ctrl and not _presampled:
             if valid_params.get('fps', 0) > 0 and valid_params.get('nframe', 0) > 0:
                 raise ValueError('fps and nframe should not be set at the same time')
             if valid_params.get('fps', 0) <= 0 and valid_params.get('nframe', 0) <= 0:
@@ -190,6 +197,11 @@ You can launch the evaluation by setting either --data and --model or --config.
     # Configuration for Resume
     # Ignore: will not rerun failed VLM inference
     parser.add_argument('--ignore', action='store_true', help='Ignore failed indices. ')
+    parser.add_argument(
+        '--allow-partial-failures', action='store_true',
+        default=os.environ.get('VANTAGE_ALLOW_PARTIAL_FAILURES', '0') == '1',
+        help='Exit 0 even if some model x dataset combinations failed (default: exit 1). '
+             'Can also be enabled with VANTAGE_ALLOW_PARTIAL_FAILURES=1.')
     # Reuse: will reuse the existing prediction files
     parser.add_argument('--reuse', action='store_true')
     # Reuse-aux: if set, when reuse is True, will also reuse the auxiliary evaluation files
@@ -197,6 +209,10 @@ You can launch the evaluation by setting either --data and --model or --config.
     parser.add_argument(
         '--use-vllm', action='store_true', help='use vllm to generate, the flag is only supported in Llama4 for now')
     parser.add_argument('--use-verifier', action='store_true', help='use verifier to evaluate')
+    parser.add_argument(
+        '--lmudata-root', type=str, default=None,
+        help='Set/override the LMUData root. Datasets are expected under '
+             '<LMUData root>/datasets/<dataset_name>. Overrides the LMUData environment variable.')
 
     args = parser.parse_args()
     return args
@@ -205,6 +221,14 @@ You can launch the evaluation by setting either --data and --model or --config.
 def main():
     logger = get_logger('RUN')
     args = parse_args()
+    # Set the LMUData root before any dataset is constructed; the CLI flag wins
+    # over any pre-existing LMUData environment variable.
+    if args.lmudata_root is not None:
+        root = osp.abspath(osp.expanduser(args.lmudata_root))
+        if not osp.isdir(root):
+            raise FileNotFoundError(f'--lmudata-root path does not exist: {root}')
+        os.environ['LMUData'] = root
+        logger.info(f'LMUData root set to {root} via --lmudata-root')
     # Allow positional config: python run.py config.json
     if args.config_pos is not None and args.config is None:
         args.config = args.config_pos
@@ -252,6 +276,9 @@ def main():
             timeout=datetime.timedelta(seconds=int(os.environ.get('DIST_TIMEOUT', 3600)))
         )
 
+    # (model, dataset, status, error) for every combination, reported at the end.
+    outcomes = []
+
     for _, model_name in enumerate(args.model):
         model = None
         date, commit_id = timestr('day'), githash(digits=8)
@@ -282,6 +309,8 @@ def main():
             if WORLD_SIZE > 1:
                 dist.barrier()
 
+            # Assume success; the failure branches below overwrite status and error.
+            outcomes.append([model_name, dataset_name, 'ok', ''])
             try:
                 pred_format = get_pred_file_format()
                 result_file_base = f'{model_name}_{dataset_name}.{pred_format}'
@@ -294,6 +323,7 @@ def main():
                     dataset = build_dataset_from_config(cfg['data'], dataset_name)
                     if dataset is None:
                         logger.error(f'Dataset {dataset_name} is not valid, will be skipped. ')
+                        outcomes[-1][2:] = ['failed', 'dataset is not valid']
                         continue
                 else:
                     dataset_kwargs = {}
@@ -309,6 +339,7 @@ def main():
                     dataset = build_dataset(dataset_name, **dataset_kwargs)
                     if dataset is None:
                         logger.error(f'Dataset {dataset_name} is not valid, will be skipped. ')
+                        outcomes[-1][2:] = ['failed', 'dataset is not valid']
                         continue
                 
                 if RANK == 0 and hasattr(dataset, "get_config_dict"):
@@ -352,7 +383,8 @@ def main():
                             verbose=args.verbose,
                             api_nproc=args.api_nproc,
                             ignore_failed=args.ignore,
-                            use_vllm=args.use_vllm)
+                            use_vllm=args.use_vllm,
+                            result_file_name=result_file_base)
                     else:
                         model = infer_data_job(
                             model,
@@ -362,7 +394,8 @@ def main():
                             verbose=args.verbose,
                             api_nproc=args.api_nproc,
                             ignore_failed=args.ignore,
-                            use_vllm=args.use_vllm)
+                            use_vllm=args.use_vllm,
+                            result_file_name=result_file_base)
 
                 # Set the judge kwargs first before evaluation or dumping
 
@@ -510,10 +543,22 @@ def main():
             except Exception as e:
                 logger.exception(f'Model {model_name} x Dataset {dataset_name} combination failed: {e}, '
                                  'skipping this combination.')
+                outcomes[-1][2:] = ['failed', f'{type(e).__name__}: {e}']
                 continue
 
     if WORLD_SIZE > 1:
         dist.destroy_process_group()
+
+    failures = [o for o in outcomes if o[2] != 'ok']
+    if RANK == 0 and outcomes:
+        summary = pd.DataFrame(outcomes, columns=['model', 'dataset', 'status', 'error'])
+        summary['error'] = summary['error'].str.slice(0, 200)
+        logger.info('Run summary:\n' + tabulate(summary, headers='keys', showindex=False))
+        if failures:
+            logger.error(f'{len(failures)} of {len(outcomes)} model x dataset combinations failed. '
+                         'Check the log above for the traceback of each failure.')
+    if failures and not args.allow_partial_failures:
+        sys.exit(1)
 
 
 if __name__ == '__main__':

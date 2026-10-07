@@ -74,29 +74,7 @@ def _chased_dp_assignment(scores: np.ndarray) -> Tuple[float, List[Tuple[int, in
 class VANTAGE_DVC(VideoBaseDataset):
     MD5 = ''
     TYPE = 'Video-DVC'
-    DENSE_CAPTION_QUERY = """You are an expert at running dense video captioning. Your task is to provide a dense, event-level video caption with precise timestamps for a given video.
-
-Structure your response as a list of events. For each event, provide the start and end timestamp in the format <HH:MM:SS><HH:MM:SS> followed by a detailed description of the event.
-
-Format each line as:
-<Start_Timestamp><End_Timestamp> Description of the event.
-
-Example 1:
-<00:00:00><00:00:02> Traffic is flowing through the intersection from top to bottom.
-<00:00:00><00:00:05> Cars and a motorcycle are waiting in the intersection for road going from right to left.
-<00:00:05><00:00:05> Traffic signal phase changes, and cars and a motorcycle start moving into the intersection for road going right to left
-<00:00:05><00:00:09> A blue vehicle travelling on road going from top to bottom drives through and collides with black SUV going from right to left. The black SUV rolls over and collides with a motorcycle.
-<00:00:09><00:00:17> Other cars slowly approach the intersection from top of the frame
-
-Example 2:
-<00:00:00><00:00:12> Traffic is continuously flowing from top to the bottom on the left of the median.
-<00:00:00><00:00:05> Traffic is continuously flowing from bottom to top on the right. The first lane on the right of the median is congested with a long queue of cars.
-<00:00:02><00:00:04> A white SUV drives slowly from bottom to top on the congested lane and stops with certain distance behind a black car
-<00:00:04><00:00:05> A blue car crashes into the white SUV, rear-ending it.
-<00:00:05><00:00:06> A white SUV collides with the blue car from behind, which in turn pushes the blue car forward, causing it to hit the first white SUV again. The three cars are now in a pile-up on the first lane on the right of the median.
-<00:00:06><00:00:07> Another white SUV crashes into the rear of the white SUV, turning the three-car pile-up into a four-car pile-up
-<00:00:07><00:00:12> Traffic continues flowing from bottom to top in another two lanes on right.
-"""
+    DENSE_CAPTION_QUERY = "Describe the notable events in the provided video. Provide the result in json format with 'mm:ss.ff' format for time depiction for each event. Use keywords 'start', 'end' and 'caption' in the json output."
 
     def __init__(self, dataset='VANTAGE_DVC', pack=False, nframe=0, fps=0, total_pixels=None, max_pixels=None, max_frames=None, test_mode=False, limit=None, random_state=None, include_categories=None, custom_prompt=None):
         self.test_mode = test_mode
@@ -151,13 +129,13 @@ Example 2:
         else:
             raise FileNotFoundError(
                 f"VANTAGE_DVC data not found under {local_dir}. "
-                "Place VANTAGE_DVC.tsv and videos/ under LMUDataRoot()/datasets/VANTAGE_DVC/."
+                "Run: python scripts/run_lmudata.py --task dvc --lmu-root ~/LMUData"
             )
         data_file = osp.join(dataset_path, f'{dataset_name}.tsv')
         if not osp.exists(data_file):
             raise FileNotFoundError(
                 f"VANTAGE_DVC TSV not found: {data_file}. "
-                "Use local data under LMUDataRoot()/datasets/VANTAGE_DVC/"
+                "Run: python scripts/run_lmudata.py --task dvc --lmu-root ~/LMUData"
             )
         return dict(data_file=data_file, root=osp.join(dataset_path, 'videos'))
 
@@ -188,7 +166,22 @@ Example 2:
         return msgs
 
     @staticmethod
-    def parse_timestamp(ts_str) -> float:
+    def parse_timestamp(ts_str, which='start'):
+        """Parse a timestamp-ish value into seconds.
+
+        Returns 0.0 for None/empty input (existing behavior other callers
+        rely on) and None for anything that genuinely cannot be parsed --
+        callers must check for None and drop the event rather than treat it
+        as time zero. Beyond the canonical 'ss', 'mm:ss' and 'hh:mm:ss'
+        forms (kept byte-identical for well-formed input), this also
+        tolerates a handful of real-world model output formats: trailing
+        unit suffixes ('4.72s' / '4.72 sec' / '4.72 seconds'), compound
+        durations ('1m5s', '2h3m4s'), a comma decimal separator
+        ('00:00:04,720'), and a 'start - end' range. For a range the
+        endpoint named by ``which`` is used: 'start' (default) takes the
+        first endpoint, 'end' takes the second, so a model that repeats the
+        whole span in both fields still yields a non-empty event.
+        """
         if ts_str is None:
             return 0.0
         if isinstance(ts_str, (int, float)):
@@ -196,16 +189,53 @@ Example 2:
         ts_str = str(ts_str).strip()
         if not ts_str:
             return 0.0
+
+        # A range like "00:04.72 - 00:09.31": use the endpoint the caller
+        # asked for (first for a 'start' field, second for an 'end' field).
+        if ' - ' in ts_str:
+            endpoints = ts_str.split(' - ')
+            ts_str = (endpoints[-1] if which == 'end' else endpoints[0]).strip()
+
         if ':' in ts_str:
+            # SRT-style comma decimal separator, e.g. "00:00:04,720".
+            if ',' in ts_str:
+                ts_str = ts_str.replace(',', '.')
             parts = ts_str.split(':')
-            if len(parts) == 2:
-                return float(parts[0]) * 60 + float(parts[1])
-            elif len(parts) == 3:
-                return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
-        return float(ts_str)
+            try:
+                if len(parts) == 2:
+                    return float(parts[0]) * 60 + float(parts[1])
+                elif len(parts) == 3:
+                    return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+                elif len(parts) == 4:
+                    # "hh:mm:ss:ff" (frames). There is no reliable fps to
+                    # convert the frame count with here, so it is dropped;
+                    # only whole hh:mm:ss precision is recovered.
+                    return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+            except ValueError:
+                return None
+            return None
+
+        # Compound duration, e.g. "1m5s", "2h3m4s".
+        m = re.match(r'^(?:(\d+(?:\.\d+)?)h)?(?:(\d+(?:\.\d+)?)m)?(?:(\d+(?:\.\d+)?)s)?$', ts_str, re.IGNORECASE)
+        if m and any(m.groups()):
+            hours, minutes, seconds = (float(g) if g else 0.0 for g in m.groups())
+            return hours * 3600 + minutes * 60 + seconds
+
+        # Trailing unit words not covered above, e.g. "4.72 sec" / "4.72 seconds"
+        # (bare "4.72s" is already matched by the compound-duration pattern).
+        m2 = re.match(r'^(\d+(?:\.\d+)?)\s*(?:seconds|second|secs|sec)$', ts_str, re.IGNORECASE)
+        if m2:
+            return float(m2.group(1))
+
+        try:
+            return float(ts_str)
+        except ValueError:
+            return None
 
     @staticmethod
-    def parse_events_from_json(text: str) -> List[Dict]:
+    def parse_events_from_json(text) -> List[Dict]:
+        if not isinstance(text, str):
+            text = ''
         text = text.strip()
         m = re.search(r'\[[\s\S]*\]', text)
         if m:
@@ -230,6 +260,16 @@ Example 2:
 
     def evaluate(self, eval_file, **judge_kwargs):
         data = load(eval_file)
+
+        from vlmeval.dataset.utils.vantagebench.emit import emit_submission
+        _suffix = eval_file.split('.')[-1]
+        submission_path = eval_file.replace(f'.{_suffix}', '_submission.jsonl')
+        emit_submission(data, osp.splitext(osp.basename(eval_file))[0], submission_path, task='dvc')
+        print(f"Submission written to: {submission_path}")
+
+        if 'answer' not in self.data.columns:
+            return {'soda_c': 0.0, 'miou': 0.0, 'iou_f1': 0.0, 'bertscore_f1': 0.0}
+
         preds = {}
         gts = {}
         categories = {}
@@ -243,8 +283,12 @@ Example 2:
             pred_events = self.parse_events_from_json(row.get('prediction', ''))
             pred_list = []
             for pe in pred_events:
+                if not isinstance(pe, dict):
+                    continue
                 start = self.parse_timestamp(pe.get('start') or pe.get('start_time', '0'))
-                end = self.parse_timestamp(pe.get('end') or pe.get('end_time', '0'))
+                end = self.parse_timestamp(pe.get('end') or pe.get('end_time', '0'), which='end')
+                if start is None or end is None:
+                    continue
                 caption = pe.get('caption', '') or pe.get('description', '') or ''
                 if caption:
                     pred_list.append({"sentence": caption, "timestamp": [start, end]})
@@ -258,8 +302,12 @@ Example 2:
             gt_timestamps = []
             gt_sentences = []
             for ge in gt_events:
+                if not isinstance(ge, dict):
+                    continue
                 start = self.parse_timestamp(ge.get('start', '0'))
-                end = self.parse_timestamp(ge.get('end', '0'))
+                end = self.parse_timestamp(ge.get('end', '0'), which='end')
+                if start is None or end is None:
+                    continue
                 caption = ge.get('caption', '') or ge.get('description', '') or ''
                 if caption:
                     gt_timestamps.append([start, end])
@@ -269,7 +317,7 @@ Example 2:
         gt_vids = list(set(gts.keys()) & set(preds.keys()))
         if not gt_vids:
             print("Warning: No videos with both predictions and ground truth.")
-            return {"overall": {"mIoU": 0.0, "IoU_F1": 0.0, "BertScore_F1": 0.0, "SODA_c": 0.0}}
+            return {'soda_c': 0.0, 'miou': 0.0, 'iou_f1': 0.0, 'bertscore_f1': 0.0}
         print(f"\nEvaluating {len(gt_vids)} videos with SODA-c...")
         bert_endpoint = judge_kwargs.get('bert_score_endpoint') or os.environ.get('BERT_SCORE_ENDPOINT')
         use_remote = bool(bert_endpoint)
@@ -280,10 +328,21 @@ Example 2:
             try:
                 import torch
                 from bert_score import BERTScorer
-                device = "cuda" if torch.cuda.is_available() else "cpu"
-                bert_scorer = BERTScorer(model_type="roberta-large", device=device)
-            except ImportError:
-                print("Warning: bert_score not available, using dummy (F1=0.5). pip install bert-score")
+                # Prefer the job's GPU when one is allocated (a low-tier card is
+                # ample for roberta-large); VANTAGE_BERT_DEVICE overrides, and a
+                # GPU-less job falls back to CPU automatically.
+                bert_device = os.environ.get("VANTAGE_BERT_DEVICE") or (
+                    "cuda" if torch.cuda.is_available() else "cpu")
+                print(f"BERTScore device: {bert_device}")
+                bert_scorer = BERTScorer(model_type="roberta-large", device=bert_device)
+            except ImportError as e:
+                raise RuntimeError(
+                    "bert_score (and/or torch) is not available in this environment. "
+                    "DVC evaluation requires it for BERTScore-based caption quality; "
+                    "silently falling back to a dummy F1=0.5 score would corrupt "
+                    "leaderboard numbers, so this is a hard failure instead. "
+                    "pip install bert-score torch"
+                ) from e
         def bert_remote(cands, refs):
             import requests
             r = requests.post(f"{bert_endpoint}/score", json={"candidates": cands, "references": refs}, timeout=300)
@@ -344,7 +403,13 @@ Example 2:
                 w.writerow([cat, f"{mean_iou:.4f}", f"{v['IoU_F1']:.4f}", f"{v['BertScore_F1']:.4f}", f"{v['SODA_c']:.4f}", v["count"]])
             w.writerow(["Overall", f"{final['overall']['mIoU']:.4f}", f"{final['overall']['IoU_F1']:.4f}", f"{final['overall']['BertScore_F1']:.4f}", f"{final['overall']['SODA_c']:.4f}", final['overall']['count']])
         dump(final, get_intermediate_file_path(eval_file, '_metrics', 'json'))
-        return final
+        overall = final.get('overall', {})
+        return {
+            'soda_c': overall.get('SODA_c', 0.0),
+            'miou': overall.get('mIoU', 0.0),
+            'iou_f1': overall.get('IoU_F1', 0.0),
+            'bertscore_f1': overall.get('BertScore_F1', 0.0),
+        }
 
 if __name__ == "__main__":
     main()

@@ -2918,12 +2918,27 @@ class TopViewRS(ImageMCQDataset):
         return acc
 
 class VANTAGE_2DPointing(ImageMCQDataset):
-    def __init__(self, dataset='VANTAGE_2DPointing', custom_prompt=None, data_root=None, **kwargs):
+    # The parent resolves supported names from DATASET_URL, which this class
+    # bypasses (load_data reads a local TSV), so register the key explicitly.
+    # With the key registered, build_dataset() constructs this class directly
+    # rather than using the generic TSV lookup.
+    @classmethod
+    def supported_datasets(cls):
+        return ['VANTAGE_2DPointing']
+
+    def __init__(self, dataset='VANTAGE_2DPointing', custom_prompt=None, data_root=None, limit=None, random_state=None, **kwargs):
         self.verbose = kwargs.get('verbose', False)
         self.custom_prompt = custom_prompt
         self._data_root_override = data_root
+        self._limit = limit
+        self._random_state = random_state
         # 1. super().__init__ will now call OUR overridden load_data
         super().__init__(dataset=dataset, **kwargs)
+        if self._limit is not None and self._limit > 0 and hasattr(self, 'data'):
+            original_size = len(self.data)
+            sample_num = max(1, int(self._limit * original_size)) if self._limit <= 1.0 else min(int(self._limit), original_size)
+            self.data = self.data.sample(n=sample_num, random_state=self._random_state).reset_index(drop=True)
+            print(f'Applied limit: using {len(self.data)} of {original_size} samples')
 
     def load_data(self, dataset):
         """
@@ -2940,8 +2955,8 @@ class VANTAGE_2DPointing(ImageMCQDataset):
         # 3. Validation
         if not osp.exists(data_file):
             raise FileNotFoundError(
-                f"Local TSV not found at {data_file}. "
-                "Ensure your data is in the datasets/VANTAGE_2DPointing/ directory."
+                f"VANTAGE_2DPointing TSV not found at {data_file}. "
+                "Run: python scripts/run_lmudata.py --task pointing --lmu-root ~/LMUData"
             )
 
         # 4. Set the img_root so build_prompt knows where images are
@@ -2964,7 +2979,7 @@ class VANTAGE_2DPointing(ImageMCQDataset):
         question = line['question']
         options = {cand: line[cand] for cand in 'ABCD' if cand in line and not pd.isna(line[cand])}
         
-        options_prompt = 'Options (Coordinates are [x,y]):\n'
+        options_prompt = 'Options (coordinates normalized to 0-1000 scale [x, y]):\n'
         for key, item in options.items():
             options_prompt += f'{key}. {item}\n'
 
@@ -2990,11 +3005,22 @@ class VANTAGE_2DPointing(ImageMCQDataset):
         from .utils import build_judge
         from ..smp.file import get_intermediate_file_path, get_file_extension
         import csv
+        import os.path as _osp
 
         assert get_file_extension(eval_file) in ['xlsx', 'json', 'tsv'], \
             'data file should be a supported format (xlsx/json/tsv) file'
 
         data = load(eval_file)
+
+        from vlmeval.dataset.utils.vantagebench.emit import emit_submission
+        _suffix = eval_file.split('.')[-1]
+        submission_path = eval_file.replace(f'.{_suffix}', '_submission.jsonl')
+        emit_submission(data, _osp.splitext(_osp.basename(eval_file))[0], submission_path, task='pointing')
+        print(f"Submission written to: {submission_path}")
+
+        if 'answer' not in self.data.columns:
+            return {}
+
         verbose = judge_kwargs.get('verbose', False) or self.verbose
         results = {}
         category_stats = defaultdict(lambda: {"correct": 0, "total": 0})
@@ -3078,4 +3104,4 @@ class VANTAGE_2DPointing(ImageMCQDataset):
                 writer.writerow([category, f"{values['acc']:.4f}", values['correct'], values['total']])
 
         print(f"\nResults saved to: {results_file}, {acc_file}, {csv_path}")
-        return acc_summary
+        return {'accuracy': overall_acc}

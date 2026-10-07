@@ -43,7 +43,7 @@ class VANTAGE_Temporal(VideoBaseDataset):
     MD5 = ''
     TYPE = 'Video-Temporal-Localization'
 
-    QUESTION_PREFIX = """Localize a series of activity events in the video, output the start and end timestamp for each event. Provide the result in json format with 'mm:ss.ff' format for time depiction for this event. Use keywords 'start' and 'end' in the json output."""
+    QUESTION_PREFIX = """Localize a series of activity events in the video, output the start and end timestamp for each event. Provide the result in json format with 'mm:ss.ss' format for time depiction for this event. Use keywords 'start' and 'end' in the json output."""
 
     def __init__(self, dataset='VANTAGE_Temporal', pack=False, nframe=0, fps=0, total_pixels=None, max_pixels=None, max_frames=None, test_mode=False, limit=None, verbose=False, random_state=None, include_categories=None, custom_prompt=None):
         self.test_mode = test_mode
@@ -164,16 +164,14 @@ class VANTAGE_Temporal(VideoBaseDataset):
             else:
                 raise FileNotFoundError(
                     f"VANTAGE_Temporal data not found under {local_dir}. "
-                    "Place VANTAGE_Temporal.tsv and videos/ under LMUDataRoot()/datasets/VANTAGE_Temporal/, "
-                    "or place annotation JSONs under annotations/ and videos under videos/ to auto-generate the TSV."
+                    "Run: python scripts/run_lmudata.py --task temporal --lmu-root ~/LMUData"
                 )
 
         data_file = osp.join(dataset_path, f'{dataset_name}.tsv')
         if not osp.exists(data_file):
             raise FileNotFoundError(
                 f"VANTAGE_Temporal TSV not found: {data_file}. "
-                "Place VANTAGE_Temporal.tsv under LMUDataRoot()/datasets/VANTAGE_Temporal/ "
-                "or place annotation JSONs in annotations/ to auto-generate it."
+                "Run: python scripts/run_lmudata.py --task temporal --lmu-root ~/LMUData"
             )
         mapping_dir = osp.join(dataset_path, 'mappings')
         if osp.exists(mapping_dir):
@@ -300,13 +298,8 @@ class VANTAGE_Temporal(VideoBaseDataset):
         if self.fps > 0:
             process_video_kwargs['fps'] = self.fps
         question = line['question']
-        template = " Please provide the result in json format with 'mm:ss.ss' format for time depiction for the event. Use keywords 'start', 'end' in the json output."
-        question = question.replace("Localize a series of activity events in the video, output the start and end timestamp for each event. Provide the result in json format with 'mm:ss.ff' format for time depiction for this event. Use keywords 'start' and 'end' in the json output.\n", "")
-        question = question.replace(" Answer the question only using start and end timestamps.", "")
         if self.custom_prompt is not None:
             question = self.custom_prompt + "\n" + question
-        else:
-            question = question + template
 
         # if self.verbose:
         #     print(f"\n{'='*80}")
@@ -411,7 +404,7 @@ class VANTAGE_Temporal(VideoBaseDataset):
                 if next_quote_idx == -1 or text_repaired[next_quote_idx - 1] == '\n':
                     text_repaired = text_repaired.rstrip() + '"'
         text_repaired = text_repaired.rstrip()
-        if not text_repaired.endswith('}'):
+        if not text_repaired.endswith(('}', ']')):
             text_repaired += '}'
         try:
             json_output = json.loads(text_repaired)
@@ -429,11 +422,31 @@ class VANTAGE_Temporal(VideoBaseDataset):
                 if strict:
                     raise ValueError(f"Failed to parse timestamps from: {text}")
                 return [0, duration]
-        start_parts = start.split(":")
-        end_parts = end.split(":")
-        start_seconds = float(start_parts[0]) * 60 + float(start_parts[1]) if len(start_parts) == 2 else float(start_parts[0])
-        end_seconds = float(end_parts[0]) * 60 + float(end_parts[1]) if len(end_parts) == 2 else float(end_parts[0])
-        return [start_seconds, end_seconds]
+        return [VANTAGE_Temporal.timestamp_to_seconds(start), VANTAGE_Temporal.timestamp_to_seconds(end)]
+
+    @staticmethod
+    def timestamp_to_seconds(value) -> float:
+        """Convert a JSON timestamp value to seconds.
+
+        Accepts a number (returned as float) or a string in 'ss', 'mm:ss' or
+        'hh:mm:ss' form (each component may carry decimals). Raises
+        ValueError for anything else so the caller can fall back to the
+        regex parser.
+        """
+        if isinstance(value, bool):
+            raise ValueError(f"Not a timestamp: {value!r}")
+        if isinstance(value, (int, float)):
+            return float(value)
+        if not isinstance(value, str):
+            raise ValueError(f"Not a timestamp: {value!r}")
+        parts = value.strip().split(":")
+        if len(parts) == 1:
+            return float(parts[0])
+        if len(parts) == 2:
+            return float(parts[0]) * 60 + float(parts[1])
+        if len(parts) == 3:
+            return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+        raise ValueError(f"Not a timestamp: {value!r}")
 
     @staticmethod
     def parse_timestamps(text: str, duration: float, strict: bool = False) -> Tuple[float, float]:
@@ -459,6 +472,16 @@ class VANTAGE_Temporal(VideoBaseDataset):
 
     def evaluate(self, eval_file, **judge_kwargs):
         data = load(eval_file)
+
+        from vlmeval.dataset.utils.vantagebench.emit import emit_submission
+        _suffix = eval_file.split('.')[-1]
+        submission_path = eval_file.replace(f'.{_suffix}', '_submission.jsonl')
+        emit_submission(data, osp.splitext(osp.basename(eval_file))[0], submission_path, task='temporal')
+        print(f"Submission written to: {submission_path}")
+
+        if 'answer' not in self.data.columns:
+            return {}
+
         verbose = judge_kwargs.get('verbose', False) or self.verbose
 
         if verbose:
@@ -512,7 +535,11 @@ class VANTAGE_Temporal(VideoBaseDataset):
         results = self._compute_metrics(outputs, eval_file, metric_funcs, verbose=verbose)
         score_file = get_intermediate_file_path(eval_file, '_metrics', 'json')
         dump(results, score_file)
-        return results
+        overall = results.get('overall', {})
+        return {
+            'miou': overall.get('iou', 0.0),
+            'precision_at_0_5': overall.get('precision@0.5', 0.0),
+        }
 
     def _get_category(self, video_id: str) -> str:
         if not self.category_mapping:

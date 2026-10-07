@@ -165,13 +165,19 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
 
 # A wrapper for infer_data, do the pre & post processing
 def infer_data_job_mt(
-    model, work_dir, model_name, dataset, verbose=False, api_nproc=4, ignore_failed=False, use_vllm=False
+    model, work_dir, model_name, dataset, verbose=False, api_nproc=4, ignore_failed=False, use_vllm=False,
+    result_file_name=None
 ):
     rank, world_size = get_rank_and_world_size()
     dataset_name = dataset.dataset_name
-    result_file = get_pred_file_path(work_dir, model_name, dataset_name, use_env_format=True)
+    if result_file_name is not None:
+        result_file = osp.join(work_dir, result_file_name)
+        stem = osp.splitext(result_file_name)[0]
+    else:
+        result_file = get_pred_file_path(work_dir, model_name, dataset_name, use_env_format=True)
+        stem = f'{model_name}_{dataset_name}'
 
-    tmpl = osp.join(work_dir, '{}' + f'{world_size}_{dataset_name}.pkl')
+    tmpl = osp.join(work_dir, '{}' + f'{world_size}_{stem}.pkl')
     out_file = tmpl.format(rank)
 
     model = infer_data(
